@@ -47,6 +47,8 @@ struct TestToolServer {
 
 const MEMO_URI: &str = "memo://codex/example-note";
 const MEMO_CONTENT: &str = "This is a sample MCP resource served by the rmcp test server.";
+const IMAGE_RESOURCE_URI: &str = "image://codex/preview.png";
+const IMAGE_RESOURCE_DATA_URL_ENV: &str = "MCP_TEST_IMAGE_RESOURCE_DATA_URL";
 const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
 const SMALL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 const APP_ONLY_CWD_MARKER_FILE_ENV: &str = "MCP_TEST_APP_ONLY_CWD_MARKER_FILE";
@@ -174,7 +176,13 @@ impl TestToolServer {
         {
             echo.description = Some(Cow::Owned("x".repeat(8 * 1024 * 1024 + 1)));
         }
-        let resources = vec![Self::memo_resource()];
+        let mut resources = vec![Self::memo_resource()];
+        if let Ok(data_url) = std::env::var(IMAGE_RESOURCE_DATA_URL_ENV)
+            && let Some((mime_type, _)) = parse_data_url(&data_url)
+        {
+            resources
+                .push(Resource::new(IMAGE_RESOURCE_URI, "preview-image").with_mime_type(mime_type));
+        }
         let resource_templates = vec![Self::memo_template()];
         Self {
             tools: Arc::new(tools),
@@ -381,6 +389,8 @@ impl TestToolServer {
                     "enum": [
                         "image_only",
                         "image_only_original_detail",
+                        "embedded_resource",
+                        "embedded_resource_with_structured_content",
                         "text_then_image",
                         "invalid_base64_then_image",
                         "invalid_image_bytes_then_image",
@@ -487,6 +497,8 @@ fn sync_barrier_map() -> &'static tokio::sync::Mutex<HashMap<String, SyncBarrier
 enum ImageScenario {
     ImageOnly,
     ImageOnlyOriginalDetail,
+    EmbeddedResource,
+    EmbeddedResourceWithStructuredContent,
     TextThenImage,
     InvalidBase64ThenImage,
     InvalidImageBytesThenImage,
@@ -628,6 +640,8 @@ impl ServerHandler for TestToolServer {
                 }])
                 .into(),
             )
+        } else if uri == IMAGE_RESOURCE_URI {
+            Ok(ReadResourceResult::new(vec![Self::image_resource_contents()?]).into())
         } else {
             Err(McpError::resource_not_found(
                 "resource_not_found",
@@ -792,6 +806,27 @@ impl ServerHandler for TestToolServer {
 }
 
 impl TestToolServer {
+    fn image_resource_contents() -> Result<ResourceContents, McpError> {
+        let data_url = std::env::var(IMAGE_RESOURCE_DATA_URL_ENV).map_err(|_| {
+            McpError::internal_error(
+                format!("missing {IMAGE_RESOURCE_DATA_URL_ENV} env var"),
+                None,
+            )
+        })?;
+        let (mime_type, blob) = parse_data_url(&data_url).ok_or_else(|| {
+            McpError::invalid_params(
+                format!("invalid data URL in {IMAGE_RESOURCE_DATA_URL_ENV}"),
+                None,
+            )
+        })?;
+        Ok(ResourceContents::BlobResourceContents {
+            uri: IMAGE_RESOURCE_URI.to_string(),
+            mime_type: Some(mime_type),
+            blob,
+            meta: None,
+        })
+    }
+
     fn parse_call_args<T: for<'de> Deserialize<'de>>(
         request: &CallToolRequestParams,
         tool_name: &'static str,
@@ -826,6 +861,20 @@ impl TestToolServer {
 
         let mut content = Vec::new();
         match args.scenario {
+            ImageScenario::EmbeddedResource
+            | ImageScenario::EmbeddedResourceWithStructuredContent => {
+                let mut result = CallToolResult::success(vec![
+                    rmcp::model::ContentBlock::text(caption),
+                    rmcp::model::ContentBlock::resource(Self::image_resource_contents()?),
+                ]);
+                if matches!(
+                    args.scenario,
+                    ImageScenario::EmbeddedResourceWithStructuredContent
+                ) {
+                    result.structured_content = Some(json!({"summary": "image resource"}));
+                }
+                return Ok(result);
+            }
             ImageScenario::ImageOnly => {
                 content.push(rmcp::model::ContentBlock::image(valid_data_b64, mime_type));
             }

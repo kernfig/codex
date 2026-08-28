@@ -10,7 +10,10 @@ use codex_protocol::items::McpToolCallItem;
 use codex_protocol::items::McpToolCallStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::mcp::CallToolResult;
-use codex_protocol::models::function_call_output_content_items_to_text;
+use codex_protocol::mcp::extract_resource_image;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::ResponseInputItem;
 use codex_protocol::protocol::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
 use rmcp::model::ListResourceTemplatesResult;
@@ -27,8 +30,8 @@ use serde_json::Value;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolOutput;
+use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use codex_protocol::protocol::McpInvocation;
 
@@ -193,12 +196,37 @@ struct ReadResourcePayload {
     result: ReadResourceResult,
 }
 
-fn call_tool_result_from_content(content: &str, success: Option<bool>) -> CallToolResult {
-    CallToolResult {
-        content: vec![serde_json::json!({"type": "text", "text": content})],
-        structured_content: None,
-        is_error: success.map(|value| !value),
-        meta: None,
+struct ResourceToolOutput(CallToolResult);
+
+impl ToolOutput for ResourceToolOutput {
+    fn log_output(&self) -> String {
+        self.0.log_output()
+    }
+
+    fn success_for_logging(&self) -> bool {
+        self.0.success()
+    }
+
+    fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
+        let mut output = self.0.as_function_call_output_payload();
+        // Preserve the existing string response for text-only resource tools.
+        if let Some([FunctionCallOutputContentItem::InputText { text }]) = output.content_items() {
+            output.body = FunctionCallOutputBody::Text(text.clone());
+        }
+        ResponseInputItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output,
+        }
+    }
+
+    fn code_mode_result(&self, payload: &ToolPayload) -> Value {
+        if self.0.content.iter().any(|block| block["type"] == "image") {
+            // Keep image bytes intact for image(result.content[i]); only the
+            // metadata text is subject to the resource's truncation budget.
+            self.0.code_mode_result(payload)
+        } else {
+            Value::String(self.log_output())
+        }
     }
 }
 
@@ -287,23 +315,40 @@ async fn run_resource_operation<T>(
 where
     T: Serialize,
 {
+    run_resource_operation_with_serializer(
+        session,
+        turn,
+        call_id,
+        invocation,
+        operation,
+        serialize_function_output,
+    )
+    .await
+}
+
+async fn run_resource_operation_with_serializer<T>(
+    session: &Arc<Session>,
+    turn: &TurnContext,
+    call_id: &str,
+    invocation: McpInvocation,
+    operation: impl Future<Output = Result<T, FunctionCallError>>,
+    serialize: impl FnOnce(T, TruncationPolicy) -> Result<ResourceToolOutput, FunctionCallError>,
+) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     emit_tool_call_begin(session, turn, call_id, invocation.clone()).await;
     let start = Instant::now();
-    let result = operation.await.and_then(|payload| {
-        serialize_function_output(payload, turn.model_info().truncation_policy.into())
-    });
+    let result = operation
+        .await
+        .and_then(|payload| serialize(payload, turn.model_info().truncation_policy.into()));
 
     match result {
         Ok(output) => {
-            let content =
-                function_call_output_content_items_to_text(&output.body).unwrap_or_default();
             emit_tool_call_end(
                 session,
                 turn,
                 call_id,
                 invocation,
                 start.elapsed(),
-                Ok(call_tool_result_from_content(&content, output.success)),
+                Ok(output.0.clone()),
             )
             .await;
             Ok(boxed_tool_output(output))
@@ -321,6 +366,29 @@ where
             Err(error)
         }
     }
+}
+
+fn serialize_read_resource_output(
+    payload: ReadResourcePayload,
+    truncation_policy: TruncationPolicy,
+) -> Result<ResourceToolOutput, FunctionCallError> {
+    let mut metadata = serde_json::to_value(&payload).map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "failed to serialize MCP resource response: {err}"
+        ))
+    })?;
+    let images = metadata["contents"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .filter_map(extract_resource_image)
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        return serialize_function_output(payload, truncation_policy);
+    }
+    let mut output = serialize_function_output(metadata, truncation_policy)?;
+    output.0.content.extend(images);
+    Ok(output)
 }
 
 fn normalize_optional_string(input: Option<String>) -> Option<String> {
@@ -346,7 +414,7 @@ fn normalize_required_string(field: &str, value: String) -> Result<String, Funct
 fn serialize_function_output<T>(
     payload: T,
     truncation_policy: TruncationPolicy,
-) -> Result<FunctionToolOutput, FunctionCallError>
+) -> Result<ResourceToolOutput, FunctionCallError>
 where
     T: Serialize,
 {
@@ -359,7 +427,12 @@ where
     // rollout and injected into model context.
     let content = truncate_text(&content, truncation_policy * 1.2);
 
-    Ok(FunctionToolOutput::from_text(content, Some(true)))
+    Ok(ResourceToolOutput(CallToolResult {
+        content: vec![serde_json::json!({"type": "text", "text": content})],
+        structured_content: None,
+        is_error: Some(false),
+        meta: None,
+    }))
 }
 
 fn parse_arguments(raw_args: &str) -> Result<Option<Value>, FunctionCallError> {

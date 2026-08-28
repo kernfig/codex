@@ -1,4 +1,6 @@
 use super::*;
+use crate::tools::context::ToolPayload;
+use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use pretty_assertions::assert_eq;
 use rmcp::model::ResourceContents;
 use serde_json::json;
@@ -64,10 +66,18 @@ fn list_resources_payload_from_all_servers_is_sorted() {
 }
 
 #[test]
-fn call_tool_result_from_content_marks_success() {
-    let result = call_tool_result_from_content("{}", Some(true));
-    assert_eq!(result.is_error, Some(false));
-    assert_eq!(result.content.len(), 1);
+fn serialized_resource_output_marks_success() {
+    let output = serialize_function_output(json!({}), TruncationPolicy::Bytes(1_024)).unwrap();
+
+    assert_eq!(
+        output.0,
+        CallToolResult {
+            content: vec![json!({"type": "text", "text": "{}"})],
+            structured_content: None,
+            is_error: Some(false),
+            meta: None,
+        }
+    );
 }
 
 #[test]
@@ -151,10 +161,26 @@ fn serialize_function_output_preserves_small_payload() {
     let expected = serde_json::to_string(&payload).expect("serialize payload");
 
     let output = serialize_function_output(payload, TruncationPolicy::Bytes(1_024))
-        .expect("serialize function output")
-        .into_text();
+        .expect("serialize function output");
+    let tool_payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    assert_eq!(
+        output.code_mode_result(&tool_payload),
+        Value::String(expected.clone())
+    );
+    let ResponseInputItem::FunctionCallOutput {
+        output: response, ..
+    } = output.to_response_item("list", &tool_payload)
+    else {
+        panic!("expected function output");
+    };
+    assert_eq!(
+        response.body,
+        FunctionCallOutputBody::Text(expected.clone())
+    );
 
-    assert_eq!(output, expected);
+    assert_eq!(output.log_output(), expected);
 }
 
 #[test]
@@ -173,10 +199,110 @@ fn serialize_function_output_caps_read_resource_payload() {
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
     let expected = truncate_text(&serialized, truncation_policy * 1.2);
 
-    let output = serialize_function_output(payload, truncation_policy)
+    let output = serialize_read_resource_output(payload, truncation_policy)
         .expect("serialize bounded function output")
-        .into_text();
+        .log_output();
 
     assert_ne!(output, serialized);
     assert_eq!(output, expected);
+}
+
+#[test]
+fn serialize_read_resource_output_emits_image_blobs_as_image_items() {
+    let image_blob = "iVBORw0KGgo=".repeat(10_000);
+    let binary_blob = "AAEC";
+    let payload = ReadResourcePayload {
+        server: "hosted".to_string(),
+        uri: "asset://collection".to_string(),
+        result: ReadResourceResult::new(vec![
+            ResourceContents::BlobResourceContents {
+                uri: "asset://preview.png".to_string(),
+                mime_type: Some("IMAGE/PNG".to_string()),
+                blob: image_blob.clone(),
+                meta: None,
+            },
+            ResourceContents::BlobResourceContents {
+                uri: "asset://archive.bin".to_string(),
+                mime_type: Some("application/octet-stream".to_string()),
+                blob: binary_blob.to_string(),
+                meta: None,
+            },
+        ]),
+    };
+    let output = serialize_read_resource_output(payload, TruncationPolicy::Bytes(1_024))
+        .expect("serialize image resource output");
+
+    let text = output.log_output();
+    let expected_metadata = json!({
+        "server": "hosted",
+        "uri": "asset://collection",
+        "contents": [
+            {
+                "uri": "asset://preview.png",
+                "mimeType": "IMAGE/PNG",
+                "blob": "<image content>",
+            },
+            {
+                "uri": "asset://archive.bin",
+                "mimeType": "application/octet-stream",
+                "blob": binary_blob,
+            },
+        ],
+        "resultType": "complete",
+    });
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).expect("parse resource metadata"),
+        expected_metadata
+    );
+    let response = output.to_response_item(
+        "read-image",
+        &ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
+    );
+    let ResponseInputItem::FunctionCallOutput {
+        output: response_output,
+        ..
+    } = &response
+    else {
+        panic!("expected function output");
+    };
+    assert_eq!(
+        &response_output.content_items().unwrap()[1..],
+        &[FunctionCallOutputContentItem::InputImage {
+            image_url: format!("data:image/png;base64,{image_blob}"),
+            detail: Some(DEFAULT_IMAGE_DETAIL),
+        }]
+    );
+    assert_eq!(
+        output.code_mode_result(&ToolPayload::Function {
+            arguments: "{}".to_string(),
+        }),
+        serde_json::to_value(&output.0).unwrap()
+    );
+    let estimated_tokens = crate::context_manager::estimate_item_token_count(&response.into());
+    assert!(
+        estimated_tokens < 3_000,
+        "image base64 must not be counted as text: {estimated_tokens}"
+    );
+
+    let event_result = output.0;
+    assert_eq!(event_result.content.len(), 2);
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            event_result.content[0]["text"]
+                .as_str()
+                .expect("event resource metadata text"),
+        )
+        .expect("parse event resource metadata"),
+        expected_metadata
+    );
+    assert_eq!(
+        event_result.content[1],
+        json!({
+            "type": "image",
+            "data": image_blob,
+            "mimeType": "image/png",
+        })
+    );
 }

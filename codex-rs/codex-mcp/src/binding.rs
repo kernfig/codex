@@ -371,12 +371,14 @@ pub(crate) fn call_tool_result_from_rmcp(result: rmcp::model::CallToolResult) ->
                 .unwrap_or_else(|_| JsonValue::String("<content>".to_string()))
         })
         .collect();
-    CallToolResult {
+    let mut result = CallToolResult {
         content,
         structured_content: result.structured_content,
         is_error: result.is_error,
         meta: result.meta.and_then(|meta| serde_json::to_value(meta).ok()),
-    }
+    };
+    result.normalize_resource_images();
+    result
 }
 
 #[cfg(test)]

@@ -2257,6 +2257,24 @@ impl CallToolResult {
         {
             match serde_json::to_string(structured_content) {
                 Ok(serialized_structured_content) => {
+                    // Structured output replaces redundant text, but must not
+                    // hide images (including promoted embedded resources).
+                    let images = content_items
+                        .into_iter()
+                        .filter(|item| {
+                            matches!(item, FunctionCallOutputContentItem::InputImage { .. })
+                        })
+                        .collect::<Vec<_>>();
+                    if !images.is_empty() {
+                        let mut items = vec![FunctionCallOutputContentItem::InputText {
+                            text: serialized_structured_content,
+                        }];
+                        items.extend(images);
+                        return FunctionCallOutputPayload {
+                            body: FunctionCallOutputBody::ContentItems(items),
+                            success: Some(self.success()),
+                        };
+                    }
                     return FunctionCallOutputPayload {
                         body: FunctionCallOutputBody::Text(serialized_structured_content),
                         success: Some(self.success()),

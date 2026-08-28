@@ -16,7 +16,8 @@ use super::ensure_model_can_access_mcp_server;
 use super::normalize_required_string;
 use super::parse_args;
 use super::parse_arguments;
-use super::run_resource_operation;
+use super::run_resource_operation_with_serializer;
+use super::serialize_read_resource_output;
 
 pub struct ReadMcpResourceHandler;
 
@@ -77,21 +78,28 @@ impl ReadMcpResourceHandler {
             arguments: arguments.clone(),
         };
 
-        run_resource_operation(&session, turn.as_ref(), &call_id, invocation, async {
-            ensure_model_can_access_mcp_server(turn.as_ref(), &server)?;
-            let result = mcp
-                .read_resource(&server, ReadResourceRequestParams::new(uri.clone()))
-                .await
-                .map_err(|err| {
-                    FunctionCallError::RespondToModel(format!("resources/read failed: {err:#}"))
-                })?;
+        run_resource_operation_with_serializer(
+            &session,
+            turn.as_ref(),
+            &call_id,
+            invocation,
+            async {
+                ensure_model_can_access_mcp_server(turn.as_ref(), &server)?;
+                let result = mcp
+                    .read_resource(&server, ReadResourceRequestParams::new(uri.clone()))
+                    .await
+                    .map_err(|err| {
+                        FunctionCallError::RespondToModel(format!("resources/read failed: {err:#}"))
+                    })?;
 
-            Ok(ReadResourcePayload {
-                server,
-                uri,
-                result,
-            })
-        })
+                Ok(ReadResourcePayload {
+                    server,
+                    uri,
+                    result,
+                })
+            },
+            serialize_read_resource_output,
+        )
         .await
     }
 }

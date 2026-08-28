@@ -9,6 +9,10 @@ use serde::Serialize;
 use std::collections::HashMap;
 use ts_rs::TS;
 
+#[path = "mcp_resource_images.rs"]
+mod resource_images;
+pub use resource_images::extract_resource_image;
+
 /// Observed state of an MCP connection in a published thread runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
